@@ -6,13 +6,16 @@ readonly BASE_INSTALLER="$SCRIPT_DIR/setup-kiosk.sh"
 readonly SYNC_SOURCE="$SCRIPT_DIR/b860h-ap-sync.sh"
 readonly SYNC_TARGET="/usr/local/sbin/counter-inspect-b860h-ap-sync"
 readonly PROFILE="counter-inspect-b860h-ap"
-readonly PROFILE_FILE="/etc/NetworkManager/system-connections/$PROFILE.nmconnection"
+readonly DEFAULT_PROFILE_FILE="/etc/NetworkManager/system-connections/$PROFILE.nmconnection"
 readonly AP_ADDRESS="10.43.0.1/24"
 readonly SOURCE_APP_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 WIFI_ONLY=false
 CONFIGURE_AP=false
 KIOSK_URL=""
 TEMP_PROFILE=""
+PROFILE_FILE="$DEFAULT_PROFILE_FILE"
+AP_TIMER_WAS_ACTIVE=false
+AP_SETUP_COMPLETE=false
 
 usage() {
     cat <<EOF
@@ -33,11 +36,91 @@ EOF
 die() { echo "Error: $*" >&2; exit 1; }
 
 cleanup() {
+    local result=$?
     if [[ -n "$TEMP_PROFILE" ]]; then
         rm -f -- "$TEMP_PROFILE"
     fi
     unset ap_password ap_confirmation
+    # Full setup may fail before reaching AP installation. Restore the old
+    # recovery timer without starting/restarting NetworkManager or wlan0.
+    if $AP_TIMER_WAS_ACTIVE && ! $AP_SETUP_COMPLETE; then
+        systemctl start counter-inspect-b860h-ap.timer || true
+    fi
+    return "$result"
 }
+
+nmcli_retry() {
+    local output result attempt
+    if output="$(LC_ALL=C nmcli "$@" 2>&1)"; then
+        printf '%s\n' "$output"
+        return 0
+    else
+        result=$?
+    fi
+    case "$output" in
+        *"disconnected from message bus"*|*"NetworkManager is not running"*|*"ServiceUnknown"*|*"NameHasNoOwner"*)
+            echo "NetworkManager's D-Bus connection disappeared; waiting for recovery before one retry." >&2
+            for (( attempt=0; attempt<10; attempt++ )); do
+                if [[ "$(LC_ALL=C nmcli -t -f RUNNING general 2>/dev/null || true)" == running ]]; then
+                    if output="$(LC_ALL=C nmcli "$@" 2>&1)"; then
+                        printf '%s\n' "$output"
+                        return 0
+                    else
+                        result=$?
+                    fi
+                    break
+                fi
+                sleep 1
+            done
+            printf '%s\n' "$output" >&2
+            echo "NetworkManager update failed. No daemon restart was attempted. Inspect its journal and coredumpctl." >&2
+            journalctl -b -u NetworkManager -n 40 --no-pager >&2 || true
+            return "$result"
+            ;;
+        *) printf '%s\n' "$output" >&2; return "$result" ;;
+    esac
+}
+
+find_profile_file() {
+    local uuid="$1" candidate
+    for candidate in /etc/NetworkManager/system-connections/*.nmconnection \
+        /run/NetworkManager/system-connections/*.nmconnection; do
+        [[ -f "$candidate" ]] || continue
+        if awk -F= -v wanted="$uuid" '
+            /^\[/ { in_connection = ($0 == "[connection]") }
+            in_connection && $1 == "uuid" && $2 == wanted { found = 1 }
+            END { exit !found }
+        ' "$candidate"; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 0
+}
+
+resolve_ap_profile() {
+    local matches stored_path
+    # NetworkManager may save or rename a keyfile differently from our initial
+    # filename. Identify the connection by ID/UUID rather than file existence.
+    matches="$(nmcli_retry -t -f UUID,NAME connection show | awk -F: -v name="$PROFILE" '$2 == name { print $1 }')"
+    [[ "$matches" != *$'\n'* ]] || die "Multiple '$PROFILE' profiles exist; resolve duplicates before setup."
+    existing_uuid="$matches"
+    PROFILE_FILE="$DEFAULT_PROFILE_FILE"
+    if [[ -n "$existing_uuid" ]]; then
+        stored_path="$(find_profile_file "$existing_uuid")"
+        if [[ -n "$stored_path" ]]; then
+            PROFILE_FILE="$stored_path"
+        elif $CONFIGURE_AP; then
+            die "Existing AP keyfile cannot be located; refusing to overwrite its credentials."
+        fi
+    elif [[ -f "$DEFAULT_PROFILE_FILE" ]]; then
+        # Recover an on-disk profile that the daemon has not loaded yet.
+        nmcli_retry connection load "$DEFAULT_PROFILE_FILE"
+        existing_uuid="$(nmcli_retry -g connection.uuid connection show "$PROFILE")"
+    fi
+}
+
+main() {
 trap cleanup EXIT
 
 while (( $# )); do
@@ -70,11 +153,18 @@ done
 grep -qx CONFIG_CONCURRENT_MODE /proc/net/rtl8189fs/drv_cfg ||
     die "The installed driver does not report CONFIG_CONCURRENT_MODE."
 [[ "$(nmcli -g WIFI-PROPERTIES.AP device show wlan1)" == yes ]] || die "wlan1 does not support AP mode."
-active_uuid="$(nmcli -g GENERAL.CON-UUID device show wlan1)"
-existing_uuid="$(nmcli -g connection.uuid connection show "$PROFILE" 2>/dev/null || true)"
+resolve_ap_profile
+active_uuid="$(nmcli_retry -g GENERAL.CON-UUID device show wlan1)"
 if [[ -n "$active_uuid" && "$active_uuid" != "--" && "$active_uuid" != "$existing_uuid" ]]; then
     die "wlan1 has an unrelated active connection; stop it explicitly before running setup."
 fi
+
+# Stop the worker before package/network/firewall work and profile changes,
+# rather than allowing an old timer to modify a connection mid-install.
+if systemctl is-active --quiet counter-inspect-b860h-ap.timer; then
+    AP_TIMER_WAS_ACTIVE=true
+fi
+systemctl stop counter-inspect-b860h-ap.timer counter-inspect-b860h-ap.service 2>/dev/null || true
 
 if ! $WIFI_ONLY; then
     if [[ -d "$SOURCE_APP_DIR/.git" && -r "$SOURCE_APP_DIR/compose.yaml" ]]; then
@@ -113,7 +203,9 @@ for route in routes:
 PY
 
 install -d -o root -g root -m 0700 /etc/NetworkManager/system-connections
-if [[ ! -f "$PROFILE_FILE" ]] || $CONFIGURE_AP; then
+resolve_ap_profile
+profile_uuid="$existing_uuid"
+if [[ -z "$existing_uuid" ]] || $CONFIGURE_AP; then
     # Keep credentials out of process arguments, environment variables and logs.
     # Escape NetworkManager keyfile strings (including leading/trailing spaces).
     keyfile_escape() {
@@ -149,17 +241,19 @@ if [[ ! -f "$PROFILE_FILE" ]] || $CONFIGURE_AP; then
     mv -f "$TEMP_PROFILE" "$PROFILE_FILE"
     TEMP_PROFILE=""
     unset ap_password ap_confirmation
+    chmod 0600 "$PROFILE_FILE"
+    chown root:root "$PROFILE_FILE"
+    nmcli_retry connection load "$PROFILE_FILE"
 else
     echo "Preserving existing hotspot SSID and credentials."
 fi
-chmod 0600 "$PROFILE_FILE"
-chown root:root "$PROFILE_FILE"
-nmcli connection load "$PROFILE_FILE"
 # Legacy RTL8189FS AP mode can reject PMF management-key installation. Keep
 # WPA2/CCMP, but disable optional 802.11w for this board's AP only. Apply to
 # existing profiles too, without prompting for or changing their password.
-previous_pmf="$(nmcli -g 802-11-wireless-security.pmf connection show "$PROFILE")"
-nmcli connection modify "$PROFILE" 802-11-wireless-security.pmf disable
+previous_pmf="$(nmcli_retry -g 802-11-wireless-security.pmf connection show uuid "$profile_uuid")"
+if [[ "$previous_pmf" != 1* ]]; then
+    nmcli_retry connection modify uuid "$profile_uuid" 802-11-wireless-security.pmf disable
+fi
 
 install -o root -g root -m 0755 "$SYNC_SOURCE" "$SYNC_TARGET"
 cat >/etc/systemd/system/counter-inspect-b860h-ap.service <<'EOF'
@@ -186,10 +280,8 @@ Unit=counter-inspect-b860h-ap.service
 WantedBy=timers.target
 EOF
 systemctl daemon-reload
-# Avoid racing a previous timer while updating an existing AP connection.
-systemctl stop counter-inspect-b860h-ap.timer
-systemctl stop counter-inspect-b860h-ap.service
 # Apply security/credential changes even when the channel did not change.
+active_uuid="$(nmcli_retry -g GENERAL.CON-UUID device show wlan1)"
 if { $CONFIGURE_AP || [[ "$previous_pmf" != 1* ]]; } &&
     [[ "$active_uuid" == "$existing_uuid" && -n "$active_uuid" ]]; then
     nmcli --wait 15 connection down uuid "$active_uuid"
@@ -202,6 +294,7 @@ if ! systemctl start counter-inspect-b860h-ap.service; then
 fi
 ap_state="$(nmcli -g GENERAL.STATE device show wlan1)"
 [[ "${ap_state%% *}" == 100 ]] || die "AP is not connected yet ($ap_state); the timer will retry."
+AP_SETUP_COMPLETE=true
 
 cat <<EOF
 
@@ -210,10 +303,18 @@ Upstream: wlan0 (existing connection)
 Hotspot:  wlan1 / $PROFILE
 Gateway:  10.43.0.1 (MQTT 1883, OTA HTTP uses the configured Compose port)
 Channel:  follows wlan0 every 10 seconds; last saved channel while offline
-Profile:  $PROFILE_FILE (root-only WPA2 credentials)
+Profile:  $PROFILE ($profile_uuid; stored by NetworkManager)
 
 Connect a phone or ESP32 to the AP and verify DHCP, MQTT and OTA access.
 Check status: nmcli device status
 Check logs:   journalctl -u counter-inspect-b860h-ap.service -n 50 --no-pager
 Change SSID/password: sudo bash $0 --wifi-only --configure-ap
 EOF
+if ! $WIFI_ONLY; then
+    echo "Kiosk configuration is complete. Reboot to start the root tty1 kiosk: sudo reboot"
+fi
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

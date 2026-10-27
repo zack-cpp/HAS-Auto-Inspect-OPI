@@ -13,6 +13,7 @@ pytestmark = pytest.mark.skipif(
     reason="B860H AP worker requires Bash",
 )
 SYNC_SCRIPT = Path(__file__).resolve().parents[1] / "setup" / "b860h-ap-sync.sh"
+INSTALL_SCRIPT = SYNC_SCRIPT.with_name("setup-kiosk-b860h.sh")
 
 
 def run_worker(tmp_path, *, frequency=2437, saved_channel=1, active="ap-uuid", state=100, up_fails=False):
@@ -102,3 +103,62 @@ def test_failed_state_with_selected_uuid_is_retried(tmp_path):
     result, commands = run_worker(tmp_path, state=120, saved_channel=6)
     assert result.returncode == 0, result.stderr
     assert 'connection up uuid ap-uuid ifname wlan1' in commands
+
+
+def run_installer_functions(body, tmp_path):
+    env = dict(os.environ, INSTALL_SCRIPT=str(INSTALL_SCRIPT),
+               ATTEMPT_FILE=str(tmp_path / "attempt"))
+    return subprocess.run(
+        ["bash", "-c", 'set -Eeuo pipefail\nsource "$INSTALL_SCRIPT"\n' + body],
+        env=env, capture_output=True, text=True, timeout=5,
+    )
+
+
+def test_rerun_finds_existing_ap_with_different_keyfile_name(tmp_path):
+    result = run_installer_functions(r'''
+nmcli() { printf '%s\n' 'upstream-uuid:factory-wifi' 'ap-uuid:counter-inspect-b860h-ap'; }
+find_profile_file() { printf '/etc/NetworkManager/system-connections/renamed-ap.nmconnection\n'; }
+resolve_ap_profile
+printf 'uuid=%s\nfile=%s\n' "$existing_uuid" "$PROFILE_FILE"
+''', tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert 'uuid=ap-uuid' in result.stdout
+    assert 'file=/etc/NetworkManager/system-connections/renamed-ap.nmconnection' in result.stdout
+
+
+def test_duplicate_ap_names_fail_without_replacing_credentials(tmp_path):
+    result = run_installer_functions(r'''
+nmcli() { printf '%s\n' 'uuid-1:counter-inspect-b860h-ap' 'uuid-2:counter-inspect-b860h-ap'; }
+resolve_ap_profile
+''', tmp_path)
+    assert result.returncode != 0
+    assert 'Multiple' in result.stderr
+
+
+def test_dbus_disconnect_retries_after_daemon_recovers(tmp_path):
+    result = run_installer_functions(r'''
+nmcli() {
+    if [[ "$*" == '-t -f RUNNING general' ]]; then echo running; return 0; fi
+    if [[ ! -f "$ATTEMPT_FILE" ]]; then
+        touch "$ATTEMPT_FILE"
+        echo 'Error: Message recipient disconnected from message bus without replying' >&2
+        return 10
+    fi
+    echo 'Profile updated'
+}
+nmcli_retry connection modify uuid ap-uuid 802-11-wireless-security.pmf disable
+''', tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert 'Profile updated' in result.stdout
+    assert 'one retry' in result.stderr
+
+
+def test_profile_lookup_does_not_treat_daemon_failure_as_missing_credentials(tmp_path):
+    result = run_installer_functions(r'''
+nmcli() { echo 'Error: D-Bus communication failed' >&2; return 10; }
+resolve_ap_profile
+echo 'incorrectly proceeding to credential prompts'
+''', tmp_path)
+    assert result.returncode != 0
+    assert 'incorrectly proceeding' not in result.stdout
+    assert 'D-Bus communication failed' in result.stderr
