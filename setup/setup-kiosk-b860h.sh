@@ -143,7 +143,7 @@ if [[ ! -f "$PROFILE_FILE" ]] || $CONFIGURE_AP; then
     {
         printf '[connection]\nid=%s\nuuid=%s\ntype=wifi\ninterface-name=wlan1\nautoconnect=false\n\n' "$PROFILE" "$profile_uuid"
         printf '[wifi]\nmode=ap\nband=bg\nchannel=%s\nssid=%s\npowersave=2\n\n' "${channel:-6}" "$(keyfile_escape "$ap_ssid")"
-        printf '[wifi-security]\nkey-mgmt=wpa-psk\nproto=rsn;\npairwise=ccmp;\ngroup=ccmp;\npsk=%s\n\n' "$(keyfile_escape "$ap_password")"
+        printf '[wifi-security]\nkey-mgmt=wpa-psk\nproto=rsn;\npairwise=ccmp;\ngroup=ccmp;\npmf=1\npsk=%s\n\n' "$(keyfile_escape "$ap_password")"
         printf '[ipv4]\nmethod=shared\naddress1=%s\nnever-default=true\n\n[ipv6]\nmethod=disabled\n' "$AP_ADDRESS"
     } >"$TEMP_PROFILE"
     mv -f "$TEMP_PROFILE" "$PROFILE_FILE"
@@ -155,6 +155,11 @@ fi
 chmod 0600 "$PROFILE_FILE"
 chown root:root "$PROFILE_FILE"
 nmcli connection load "$PROFILE_FILE"
+# Legacy RTL8189FS AP mode can reject PMF management-key installation. Keep
+# WPA2/CCMP, but disable optional 802.11w for this board's AP only. Apply to
+# existing profiles too, without prompting for or changing their password.
+previous_pmf="$(nmcli -g 802-11-wireless-security.pmf connection show "$PROFILE")"
+nmcli connection modify "$PROFILE" 802-11-wireless-security.pmf disable
 
 install -o root -g root -m 0755 "$SYNC_SOURCE" "$SYNC_TARGET"
 cat >/etc/systemd/system/counter-inspect-b860h-ap.service <<'EOF'
@@ -166,7 +171,7 @@ After=NetworkManager.service counter-inspect-mqtt-firewall.service
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/counter-inspect-b860h-ap-sync
-TimeoutStartSec=50
+TimeoutStartSec=90
 EOF
 cat >/etc/systemd/system/counter-inspect-b860h-ap.timer <<'EOF'
 [Unit]
@@ -181,15 +186,22 @@ Unit=counter-inspect-b860h-ap.service
 WantedBy=timers.target
 EOF
 systemctl daemon-reload
-systemctl enable --now counter-inspect-b860h-ap.timer
-# Apply new credentials on rerun even when the channel did not change.
-if $CONFIGURE_AP && [[ "$active_uuid" == "$existing_uuid" && -n "$active_uuid" ]]; then
+# Avoid racing a previous timer while updating an existing AP connection.
+systemctl stop counter-inspect-b860h-ap.timer
+systemctl stop counter-inspect-b860h-ap.service
+# Apply security/credential changes even when the channel did not change.
+if { $CONFIGURE_AP || [[ "$previous_pmf" != 1* ]]; } &&
+    [[ "$active_uuid" == "$existing_uuid" && -n "$active_uuid" ]]; then
     nmcli --wait 15 connection down uuid "$active_uuid"
 fi
+systemctl enable --now counter-inspect-b860h-ap.timer
 if ! systemctl start counter-inspect-b860h-ap.service; then
     journalctl --no-pager -n 30 -u counter-inspect-b860h-ap.service >&2
-    die "AP activation failed; the timer will retry. Check the service journal."
+    journalctl --no-pager -n 40 -u NetworkManager -u wpa_supplicant >&2
+    die "AP activation failed; the timer will retry. Check NetworkManager and supplicant errors above."
 fi
+ap_state="$(nmcli -g GENERAL.STATE device show wlan1)"
+[[ "${ap_state%% *}" == 100 ]] || die "AP is not connected yet ($ap_state); the timer will retry."
 
 cat <<EOF
 

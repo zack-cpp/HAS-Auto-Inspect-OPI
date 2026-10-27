@@ -11,7 +11,7 @@ interfaces_ready() {
 }
 
 sync_ap() {
-    local channel configured_channel active_uuid profile_uuid
+    local channel configured_channel active_uuid profile_uuid state activation_rc
 
     interfaces_ready || {
         echo "B860H Wi-Fi interfaces are not ready; retrying on the next timer tick."
@@ -23,6 +23,17 @@ sync_ap() {
     if [[ -n "$active_uuid" && "$active_uuid" != "--" && "$active_uuid" != "$profile_uuid" ]]; then
         echo "Refusing to replace an unrelated connection on $AP_IFACE." >&2
         return 1
+    fi
+    state="$(nmcli -g GENERAL.STATE device show "$AP_IFACE")"
+    state="${state%% *}"
+    if [[ "$active_uuid" == "$profile_uuid" ]]; then
+        if [[ "$state" =~ ^[0-9]+$ ]] && (( state >= 40 && state < 100 )); then
+            echo "AP activation is still in progress; leaving NetworkManager to complete it."
+            return 0
+        elif [[ "$state" != 100 ]]; then
+            # Having our UUID selected is not proof the AP is connected.
+            active_uuid=""
+        fi
     fi
 
     # Realtek's two netdevs share one radio. Pin the AP to the associated
@@ -54,7 +65,14 @@ sync_ap() {
         return 1
     fi
     if [[ "$active_uuid" != "$profile_uuid" ]]; then
-        nmcli --wait 20 connection up uuid "$profile_uuid" ifname "$AP_IFACE"
+        if nmcli --wait 60 connection up uuid "$profile_uuid" ifname "$AP_IFACE"; then
+            echo "B860H AP connection activated."
+        else
+            activation_rc=$?
+            nmcli -f GENERAL.STATE,GENERAL.REASON device show "$AP_IFACE" >&2 || true
+            echo "AP activation failed. Check: journalctl -b -u NetworkManager -u wpa_supplicant -n 100 --no-pager" >&2
+            return "$activation_rc"
+        fi
     fi
 }
 
