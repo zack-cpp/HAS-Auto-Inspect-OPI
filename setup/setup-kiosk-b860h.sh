@@ -5,6 +5,8 @@ readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly BASE_INSTALLER="$SCRIPT_DIR/setup-kiosk.sh"
 readonly SYNC_SOURCE="$SCRIPT_DIR/b860h-ap-sync.sh"
 readonly SYNC_TARGET="/usr/local/sbin/counter-inspect-b860h-ap-sync"
+readonly CLEANUP_SOURCE="$SCRIPT_DIR/b860h_dnsmasq_cleanup.py"
+readonly CLEANUP_TARGET="/usr/local/sbin/counter-inspect-b860h-dnsmasq-cleanup"
 readonly PROFILE="counter-inspect-b860h-ap"
 readonly DEFAULT_PROFILE_FILE="/etc/NetworkManager/system-connections/$PROFILE.nmconnection"
 readonly AP_ADDRESS="10.43.0.1/24"
@@ -137,7 +139,13 @@ done
 (( EUID == 0 )) || die "Run this installer with sudo."
 model="$(tr -d '\0' </proc/device-tree/model)"
 [[ "$model" == *B860H* ]] || die "This installer is only for ZTE B860H, detected '$model'."
-[[ -r "$BASE_INSTALLER" && -r "$SYNC_SOURCE" ]] || die "Copy the complete setup directory."
+[[ -r "$BASE_INSTALLER" && -r "$SYNC_SOURCE" && -r "$CLEANUP_SOURCE" ]] || die "Copy the complete setup directory."
+# A fresh server image may not include the Wi-Fi inspection tools yet. The
+# shared kiosk installer installs its own packages later in this run.
+if ! command -v nmcli >/dev/null || ! command -v iw >/dev/null || ! command -v python3 >/dev/null; then
+    apt-get update
+    apt-get install -y network-manager iw python3
+fi
 for command in iw nmcli readlink; do
     command -v "$command" >/dev/null || die "Install $command before setting up B860H Wi-Fi."
 done
@@ -165,6 +173,19 @@ if systemctl is-active --quiet counter-inspect-b860h-ap.timer; then
     AP_TIMER_WAS_ACTIVE=true
 fi
 systemctl stop counter-inspect-b860h-ap.timer counter-inspect-b860h-ap.service 2>/dev/null || true
+
+# Recover stale DNS sockets before the shared installer activates eth1. This
+# helper never touches live NetworkManager children or upstream DNS services.
+install -o root -g root -m 0755 "$CLEANUP_SOURCE" "$CLEANUP_TARGET"
+"$CLEANUP_TARGET" wlan1 eth1
+install -d -m 0755 /etc/systemd/system/NetworkManager.service.d
+cat >/etc/systemd/system/NetworkManager.service.d/counter-inspect-b860h.conf <<'EOF'
+[Service]
+# Clean up NM-owned DHCP helpers if the daemon crashes. Apply on the next
+# daemon lifecycle; do not restart the upstream Wi-Fi during installation.
+KillMode=control-group
+EOF
+systemctl daemon-reload
 
 if ! $WIFI_ONLY; then
     if [[ -d "$SOURCE_APP_DIR/.git" && -r "$SOURCE_APP_DIR/compose.yaml" ]]; then

@@ -1,8 +1,17 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
+
 import paho.mqtt.client as mqtt
 
-from .config import BrokerSettings, RuntimeSettings
+from .config import BrokerSettings, ConfigStore, RuntimeSettings
+
+
+def scoped_client_id(client_id: str, key: bytes) -> str:
+    """Keep broker client IDs unique per installation and stable across restarts."""
+    suffix = hmac.new(key, b"counter-inspect-mqtt-instance-v1", hashlib.sha256).hexdigest()[:12]
+    return f"{client_id}_{suffix}"
 
 
 def create_client(
@@ -12,7 +21,7 @@ def create_client(
 ) -> mqtt.Client:
     client = mqtt.Client(
         callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
-        client_id=client_id,
+        client_id=scoped_client_id(client_id, ConfigStore().read_key()),
         protocol=mqtt.MQTTv311,
     )
     if broker.credentials.username or broker.credentials.password:

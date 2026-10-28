@@ -65,6 +65,9 @@ sync_ap() {
         return 1
     fi
     if [[ "$active_uuid" != "$profile_uuid" ]]; then
+        # A crashed NetworkManager with KillMode=process may leave its old
+        # dnsmasq behind, holding 10.43.0.1:53. Only reap verified orphans.
+        /usr/local/sbin/counter-inspect-b860h-dnsmasq-cleanup wlan1
         if nmcli --wait 60 connection up uuid "$profile_uuid" ifname "$AP_IFACE"; then
             echo "B860H AP connection activated."
         else

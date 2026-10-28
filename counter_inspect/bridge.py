@@ -130,15 +130,21 @@ class BridgeService:
         except UnicodeDecodeError:
             self.logger.warning("Ignored non-UTF-8 payload on %s", message.topic)
             return
-        self.logger.info("Local -> remote | %s: %s", message.topic, payload)
+        self.logger.info("Local MQTT received | %s: %s", message.topic, payload)
         with self._client_lock:
             remote = self.remote_client
         try:
             if remote is None:
                 raise RuntimeError("remote client is unavailable")
             result = remote.publish(message.topic, payload)
-            if message.topic == LOCAL_TOPICS[0] and result.rc != mqtt.MQTT_ERR_SUCCESS:
-                self.queue_save(payload)
+            if result.rc == mqtt.MQTT_ERR_SUCCESS:
+                # QoS 0 success means accepted by the client library, not an
+                # acknowledgement from the remote broker.
+                self.logger.info("Queued for remote MQTT | %s", message.topic)
+            else:
+                self.logger.warning("Remote MQTT publish failed on %s: code %s", message.topic, result.rc)
+                if message.topic == LOCAL_TOPICS[0]:
+                    self.queue_save(payload)
         except Exception as exc:
             self.logger.warning("Remote publish failed: %s", exc)
             if message.topic == LOCAL_TOPICS[0]:
